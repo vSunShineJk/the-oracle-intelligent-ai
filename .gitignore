@@ -39,6 +39,11 @@ wheels/
 # ── Temporary / scratch files ────────────────────────────────────────────────
 tmp.txt
 
+# ── Generated audio output files ─────────────────────────────────────────────
+voice/final_output.mp3
+voice/test_output*.mp3
+voice/tts_edge_output*.mp3
+
 
 /documentation
 /memories/user.md
