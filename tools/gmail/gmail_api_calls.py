@@ -20,11 +20,9 @@ socket.setdefaulttimeout(30)
 # ═══════════════════════════════════════════════════════════════
 
 def _get_service(token_path: str):
-    print(f"[_get_service] loading credentials from {token_path}...")
     creds = Credentials.from_authorized_user_file(token_path, SCOPES)
 
     if creds.expired and creds.refresh_token:
-        print("[_get_service] token expired — refreshing...")
         creds.refresh(Request())
         with open(token_path, "w") as f:
             f.write(creds.to_json())
@@ -36,11 +34,9 @@ def check_connection(token_path: str) -> bool:
     """Quick check: can we reach Gmail with this token?"""
     try:
         _get_service(token_path)
-        print(f"[check_connection] connection OK: {token_path}")
         return True
     except Exception as e:
-        print(f"[check_connection] connection FAILED: {e}")
-        return False
+        return e
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -84,6 +80,17 @@ def _parse_email(raw: dict) -> dict:
         "mime_type":     raw["payload"].get("mimeType", ""),
         "is_read":       "UNREAD" not in raw.get("labelIds", []),
     }
+
+
+def _parse_email_slim(raw: dict) -> dict:
+    """
+    Same as _parse_email but WITHOUT the full body — used for list/search
+    results so we don't blow up context with full bodies for every result.
+    Use _parse_email (via a "get one email" tool) when the full body is needed.
+    """
+    email = _parse_email(raw)
+    email.pop("body", None)
+    return email
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -131,31 +138,25 @@ def _list_message_ids(service, query: str = "") -> list[str]:
 # ═══════════════════════════════════════════════════════════════
 
 def fetch_new_emails(token_path: str, since_internal_date: int | None = None) -> list[dict]:
-    print("[fetch_new_emails] connecting to Gmail API...")
     service = _get_service(token_path)
 
     if since_internal_date:
         # internalDate is milliseconds → seconds. +1 skips the email we already have
         seconds = (since_internal_date // 1000) + 1
         query = f"after:{seconds}"
-        print(f"[fetch_new_emails] fetching emails newer than timestamp {seconds}...")
     else:
         query = ""
-        print("[fetch_new_emails] DB is empty — fetching all emails (first sync)...")
 
     ids = _list_message_ids(service, query)
-    print(f"[fetch_new_emails] {len(ids)} new emails to download")
 
     if not ids:
         return []
 
     emails = []
     for i, msg_id in enumerate(ids, start=1):
-        print(f"[fetch_new_emails] downloading {i}/{len(ids)}...")
         raw = service.users().messages().get(userId="me", id=msg_id).execute()
         emails.append(_parse_email(raw))
 
-    print(f"[fetch_new_emails] done — {len(emails)} emails fetched")
     return emails
 
 
@@ -164,7 +165,6 @@ def fetch_new_emails(token_path: str, since_internal_date: int | None = None) ->
 # ═══════════════════════════════════════════════════════════════
 
 def fetch_last_emails(token_path: str, count: int = 5) -> list[dict]:
-    print(f"[fetch_last_emails] fetching the most recent {count} emails for a quick peek...")
     """Fetch the most recent N emails. Useful for quick tests."""
     service = _get_service(token_path)
     response = service.users().messages().list(userId="me", maxResults=count).execute()
@@ -172,7 +172,7 @@ def fetch_last_emails(token_path: str, count: int = 5) -> list[dict]:
     emails = []
     for msg in response.get("messages", []):
         raw = service.users().messages().get(userId="me", id=msg["id"]).execute()
-        emails.append(_parse_email(raw))
+        emails.append(_parse_email_slim(raw))
 
     return emails
 
@@ -182,14 +182,47 @@ def fetch_last_emails(token_path: str, count: int = 5) -> list[dict]:
 # ═══════════════════════════════════════════════════════════════
 
 def send_email(token_path: str, to: str, subject: str, body: str) -> bool:
-    print(f"[send_email] sending email to {to} with subject '{subject}'...")
     service = _get_service(token_path)
     message = f"To: {to}\r\nSubject: {subject}\r\n\r\n{body}"
     encoded = base64.urlsafe_b64encode(message.encode("utf-8")).decode("utf-8")
     try:
-        sent = service.users().messages().send(userId="me", body={"raw": encoded}).execute()
-        print(f"[send_email] email sent — ID: {sent['id']}")
+        service.users().messages().send(userId="me", body={"raw": encoded}).execute()
         return True
     except Exception as e:
-        print(f"[send_email] send failed: {e}")
         return False
+
+
+def gmail_search_emails(token_path: str, query: str, max_results: int = 10) -> list[dict]:
+    service = _get_service(token_path)
+    response = service.users().messages().list(userId="me", q=query, maxResults=max_results).execute()
+
+    emails = []
+    for msg in response.get("messages", []):
+        raw = service.users().messages().get(userId="me", id=msg["id"]).execute()
+        emails.append(_parse_email_slim(raw))
+    return emails
+
+
+def get_email(token_path: str, message_id: str) -> dict | None:
+    """Fetch ONE email in full (including body) by its id. Use after a search/list call."""
+    service = _get_service(token_path)
+    try:
+        raw = service.users().messages().get(userId="me", id=message_id).execute()
+    except Exception:
+        return None
+    return _parse_email(raw)
+
+
+def count_by_label(token_path: str, label: str = "UNREAD") -> dict:
+    """
+    Fast count using Gmail's label metadata directly — no pagination needed.
+    label: a Gmail label id, e.g. 'UNREAD', 'INBOX', 'SENT', 'SPAM', 'TRASH'.
+    Returns {"label": ..., "messages_total": ..., "messages_unread": ...}.
+    """
+    service = _get_service(token_path)
+    result = service.users().labels().get(userId="me", id=label).execute()
+    return {
+        "label": label,
+        "messages_total": result.get("messagesTotal", 0),
+        "messages_unread": result.get("messagesUnread", 0),
+    }
